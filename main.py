@@ -3,7 +3,6 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import chess
-import chess.engine
 
 app = FastAPI()
 
@@ -49,16 +48,30 @@ def player_move(req: MoveRequest):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid FEN")
 
-    # Parse player move in either SAN or UCI
+    # Parse player move in either SAN or UCI (with auto-queen promotion if missing)
     move = None
     try:
         # Try SAN first
         move = board.parse_san(req.move)
     except Exception:
+        # Try UCI, and auto-append 'q' for pawn promotions if user omitted it
+        mv_text = req.move.strip()
         try:
-            move = chess.Move.from_uci(req.move)
-            if move not in board.legal_moves:
-                raise ValueError("Illegal move")
+            mv = chess.Move.from_uci(mv_text)
+            # If it's illegal, check if this is a missing-promotion case and try with 'q'
+            if mv not in board.legal_moves:
+                if len(mv_text) == 4:  # from-to only
+                    try:
+                        mv_q = chess.Move.from_uci(mv_text + 'q')
+                        if mv_q in board.legal_moves:
+                            mv = mv_q
+                        else:
+                            raise ValueError("Illegal move")
+                    except Exception:
+                        raise ValueError("Invalid or illegal move")
+                else:
+                    raise ValueError("Invalid or illegal move")
+            move = mv
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid or illegal move")
 
@@ -91,7 +104,16 @@ def validate_move(fen: str, move: str):
         try:
             mv = board.parse_san(move)
         except Exception:
-            mv = chess.Move.from_uci(move)
+            # Try UCI with auto-queen promotion fallback
+            mv_text = move.strip()
+            try:
+                mv = chess.Move.from_uci(mv_text)
+                if mv not in board.legal_moves and len(mv_text) == 4:
+                    mv_q = chess.Move.from_uci(mv_text + 'q')
+                    if mv_q in board.legal_moves:
+                        mv = mv_q
+            except Exception:
+                return {"ok": False, "error": "Invalid move format"}
         if mv not in board.legal_moves:
             raise ValueError("Illegal move")
         return {"ok": True}
@@ -113,8 +135,9 @@ def elo_to_level(elo: int) -> int:
 def choose_ai_move(board: chess.Board, elo: int) -> chess.Move:
     """
     Lightweight AI:
-    - Sample from legal moves with quality-weighted probabilities depending on ELO
-    - For higher ELO, perform shallow minimax lookahead using material evaluation
+    - Level 1: random
+    - Level 2: prefer best capture
+    - Level 3-4: shallow minimax with alpha-beta
     """
     import random
 
@@ -139,6 +162,7 @@ def choose_ai_move(board: chess.Board, elo: int) -> chess.Move:
         for piece_type, val in piece_values.items():
             score += len(b.pieces(piece_type, chess.WHITE)) * val
             score -= len(b.pieces(piece_type, chess.BLACK)) * val
+        # Evaluate from side to move perspective
         return score if b.turn == chess.WHITE else -score
 
     # For level 2: pick best capture if available, else random
